@@ -3,7 +3,7 @@
 
 struct tp_data
 {
-    tp_tid_t            tid;
+    tp_tid              tid;
     bool                ret;
     tp_func             func;
     void*               args;
@@ -53,6 +53,11 @@ static void* tp_worker( void* args )
         pthread_mutex_lock( &tp->waiting.mutex );
         while ( tp->waiting.head == NULL )
         {
+            if ( tp->should_end == true )
+            {
+                pthread_mutex_unlock( &tp->waiting.mutex );
+                return NULL;
+            }
             pthread_cond_wait( &tp->waiting.cond, &tp->waiting.mutex );
             if ( tp->should_end == true )
             {
@@ -62,18 +67,19 @@ static void* tp_worker( void* args )
         }
         curr = tp->waiting.head;
         tp->waiting.head = curr->next;
-        pthread_mutex_unlock( &tp->waiting.mutex );
         curr->next = NULL;
+        pthread_mutex_unlock( &tp->waiting.mutex );
+        pthread_cond_signal( &tp->done.cond );
 
         // run job
         atomic_store( &curr->func.status, TP_RUNNING );
         if ( curr->func.ret == true )
         {
-            curr->func.res = curr->func.func( curr->func.args );
+            curr->func.res = curr->func.func( curr->func.args, tp, curr->func.tid );
         }
         else
         {
-            curr->func.func( curr->func.args );
+            curr->func.func( curr->func.args, tp, curr->func.tid );
         }
 
         // clean up
@@ -106,7 +112,7 @@ static void* tp_worker( void* args )
 }
 
 
-static inline tp_tid_t tp_next_tid( tp_t* restrict tp )
+static inline tp_tid tp_next_tid( tp_t* restrict tp )
 {
     return atomic_fetch_add( &tp->tid_counter, 1 );
 }
@@ -124,11 +130,11 @@ tp_t* tp_init( size_t thread_num )
     pthread_mutex_init( &tp->waiting.mutex, NULL );
     pthread_mutex_init( &tp->done.mutex, NULL );
     pthread_cond_init( &tp->waiting.cond, NULL );
+    pthread_cond_init( &tp->done.cond, NULL );
 
     for ( size_t i = 0; i < tp->worker_count; i++ )
     {
         pthread_create( &tp->worker[i], NULL, tp_worker, tp );
-        // pthread_detach( tp->worker[i] );
     }
 
     if ( std_tp == NULL )
@@ -142,8 +148,10 @@ tp_t* tp_init( size_t thread_num )
 
 void tp_destroy_p( tp_t* tp )
 {
+    pthread_mutex_lock( &tp->waiting.mutex );
     atomic_store( &tp->should_end, true );
     pthread_cond_broadcast( &tp->waiting.cond );
+    pthread_mutex_unlock( &tp->waiting.mutex );
     for ( size_t i = 0; i < tp->worker_count; i++ )
     {
         pthread_join( tp->worker[i], NULL );
@@ -151,6 +159,7 @@ void tp_destroy_p( tp_t* tp )
     pthread_mutex_destroy( &tp->waiting.mutex );
     pthread_mutex_destroy( &tp->done.mutex );
     pthread_cond_destroy( &tp->waiting.cond );
+    pthread_cond_destroy( &tp->done.cond );
     // pop both queue
     tp_node_t* temp;
     tp_node_t* curr = tp->waiting.head;
@@ -173,9 +182,25 @@ void tp_destroy_p( tp_t* tp )
 }
 
 
-tp_tid_t tp_add_p( tp_t* tp, bool ret, tp_func func, void* args )
+void tp_wait_p( tp_t* tp )
 {
     pthread_mutex_lock( &tp->waiting.mutex );
+    while ( tp->waiting.head != NULL )
+    {
+        pthread_cond_wait( &tp->done.cond, &tp->waiting.mutex );
+    }
+    pthread_mutex_unlock( &tp->waiting.mutex );
+    tp_destroy_p( tp );
+}
+
+
+tp_tid tp_async_p( tp_t* tp, bool ret, tp_func func, void* args )
+{
+    pthread_mutex_lock( &tp->waiting.mutex );
+    if ( tp->should_end == true )
+    {
+        return TP_ASYNC_FAIL;
+    }
     if ( tp->waiting.head == NULL )
     {
         tp->waiting.head = tp->waiting.tail = malloc( sizeof (tp_node_t) );
@@ -185,7 +210,7 @@ tp_tid_t tp_add_p( tp_t* tp, bool ret, tp_func func, void* args )
         tp->waiting.tail->next = malloc( sizeof (tp_node_t) );
         tp->waiting.tail = tp->waiting.tail->next;
     }
-    tp_tid_t tid = tp_next_tid(tp);
+    tp_tid tid = tp_next_tid(tp);
     *(tp->waiting.tail) = (tp_node_t)
     {
         .func = 
@@ -203,7 +228,7 @@ tp_tid_t tp_add_p( tp_t* tp, bool ret, tp_func func, void* args )
 }
 
 
-bool tp_query_p( tp_t* tp, tp_tid_t tid, tp_thread_t* thread )
+bool tp_query_p( tp_t* tp, tp_tid tid, tp_thread_t* thread )
 {
     pthread_mutex_lock( &tp->waiting.mutex );
     for ( tp_node_t* curr = tp->waiting.head; curr != NULL; curr = curr->next )
